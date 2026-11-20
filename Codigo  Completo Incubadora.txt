@@ -1,0 +1,203 @@
+/*
+  INCUBADORA DE HUEVOS DE GALLINA - 21 días
+  Placa: ESP32-C3 Mini (S Mini)
+
+  Parámetros (archivo Proyecto_Incubacion_Huevos_Profesional):
+    - Temperatura días 1-21: 37,5 - 37,8 °C  (objetivo 37,7)
+    - Humedad días 1-17:     50 - 60 %  (objetivo 55 %)
+    - Humedad desde día 18:  65 - 70 %
+    - Motor (volteo): gira lento hasta el día 17; se detiene el día 18
+
+  Pines (según tu esquema):
+    GPIO0  -> resistencia (optoacoplador PC817 -> transistor -> relé, activo en HIGH)
+    GPIO7  -> ventilador
+    GPIO10 -> motor (PWM)
+    GPIO4  -> DHT22 (sensor 1)
+    GPIO1  -> DHT22 (sensor 2)
+
+  Librería: "DHT sensor library" de Adafruit (+ Adafruit Unified Sensor)
+*/
+
+#include <DHT.h>
+//#include <Preferences.h>
+
+// ---------------- PINES ----------------
+#define PIN_RESISTENCIA 0
+#define PIN_VENTILADOR  7
+#define PIN_MOTOR       10
+#define PIN_DHT1        4
+#define PIN_DHT2        1
+
+#define DHTTYPE DHT22
+
+// Niveles lógicos (tu relé de la resistencia se activa con HIGH)
+#define RESISTENCIA_ON  HIGH
+#define RESISTENCIA_OFF LOW
+// Ventilador: HIGH = encendido (cámbialo si tu driver trabaja al revés)
+#define VENTILADOR_ON   HIGH
+#define VENTILADOR_OFF  LOW
+
+// ---------------- PARÁMETROS ----------------
+const float TEMP_OBJETIVO   = 37.7;   // °C: aquí se apaga la resistencia
+const float TEMP_HISTERESIS = 0.2;    // se enciende de nuevo en 37.5
+const float TEMP_MAXIMA     = 38.5;   // corte de seguridad
+
+const float HUM_MIN_1 = 50.0, HUM_MAX_1 = 60.0;   // días 1-17 (objetivo 55)
+const float HUM_MIN_2 = 65.0, HUM_MAX_2 = 70.0;   // desde día 18
+
+const int  DIA_PARAR_VOLTEO = 18;
+const int  DIAS_TOTALES     = 21;
+
+// Motor
+const int  VELOCIDAD_MOTOR = 90;      // 0-255 (bajo = lento). Súbelo si se atasca.
+const bool MOTOR_CONTINUO  = true;    // true: gira lento todo el tiempo
+const unsigned long MOTOR_ON_MS  = 60UL * 1000UL;        // si MOTOR_CONTINUO=false: gira 1 min...
+const unsigned long MOTOR_OFF_MS = 60UL * 60UL * 1000UL; // ...y descansa 1 hora
+
+// Para pruebas: pon otro día de inicio (1 = normal)
+const int  DIA_INICIAL = 1;
+// Ponlo en true UNA vez para empezar una incubación nueva (borra el avance guardado)
+const bool REINICIAR_CONTEO = false;
+
+// ---------------- VARIABLES ----------------
+DHT dht1(PIN_DHT1, DHTTYPE);
+DHT dht2(PIN_DHT2, DHTTYPE);
+//Preferences prefs;
+
+unsigned long minutosGuardados = 0;   // minutos de incubación acumulados (sobreviven a cortes de luz)
+unsigned long ultimoMinuto = 0;
+unsigned long ultimaLectura = 0;
+const unsigned long INTERVALO_LECTURA = 2500;   // DHT22 necesita >= 2 s
+
+bool resistenciaOn = false;
+bool motorEncendido = false;
+unsigned long cambioMotor = 0;
+
+// ---------------- UTILIDADES ----------------
+void pwmMotor(int duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_MOTOR, duty);
+#else
+  ledcWrite(0, duty);
+#endif
+}
+
+int diaActual() {
+  return DIA_INICIAL + (int)(minutosGuardados / 1440UL);  // 1440 min = 24 h
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_RESISTENCIA, OUTPUT);
+  pinMode(PIN_VENTILADOR, OUTPUT);
+  digitalWrite(PIN_RESISTENCIA, RESISTENCIA_OFF);   // seguro: resistencia apagada
+  digitalWrite(PIN_VENTILADOR, LOW);      // ventilador siempre encendido
+
+  // PWM del motor (5 kHz, 8 bits)
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_MOTOR, 5000, 8);
+#else
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(PIN_MOTOR, 0);
+#endif
+  pwmMotor(0);
+
+  dht1.begin();
+  dht2.begin();
+
+  // Recuperar el avance de la incubación después de un corte de luz
+  //prefs.begin("incubadora", false);
+  //if (REINICIAR_CONTEO) prefs.putULong("minutos", 0);
+  //minutosGuardados = prefs.getULong("minutos", 0);
+  //ultimoMinuto = millis();
+
+  Serial.println(F("Incubadora iniciada"));
+  Serial.print(F("Dia actual: ")); Serial.println(diaActual());
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  // Contar minutos y guardar cada 10 min
+  if (millis() - ultimoMinuto >= 60000UL) {
+    ultimoMinuto += 60000UL;
+    minutosGuardados++;
+    //if (minutosGuardados % 10 == 0) prefs.putULong("minutos", minutosGuardados);
+  }
+
+  int dia = diaActual();
+
+  // Ventilador siempre activo
+  digitalWrite(PIN_VENTILADOR, LOW);
+
+  // ---- Motor ----
+  if (dia >= DIA_PARAR_VOLTEO) {
+    pwmMotor(0);                                   // desde el día 18: quieto
+    motorEncendido = false;
+  } else if (MOTOR_CONTINUO) {
+    pwmMotor(VELOCIDAD_MOTOR);
+    motorEncendido = true;
+  }/* else {
+    unsigned long espera = motorEncendido ? MOTOR_ON_MS : MOTOR_OFF_MS;
+    if (millis() - cambioMotor >= espera) {
+      motorEncendido = !motorEncendido;
+      cambioMotor = millis();
+    }
+    pwmMotor(motorEncendido ? VELOCIDAD_MOTOR : 0);
+  }*/
+
+  // ---- Lectura de sensores ----
+  if (millis() - ultimaLectura < INTERVALO_LECTURA) return;
+  ultimaLectura = millis();
+
+  float t1 = dht1.readTemperature(), h1 = dht1.readHumidity();
+  float t2 = dht2.readTemperature(), h2 = dht2.readHumidity();
+  bool ok1 = !isnan(t1) && !isnan(h1);
+  bool ok2 = !isnan(t2) && !isnan(h2);
+
+  // Si ambos sensores fallan: resistencia apagada por seguridad
+  if (!ok1 && !ok2) {
+    resistenciaOn = false;
+    digitalWrite(PIN_RESISTENCIA, HIGH);
+    Serial.println(F("ERROR: fallan ambos sensores, resistencia apagada"));
+    return;
+  }
+
+  float temp, hum, tempMax;
+  if (ok1 && ok2) {
+    temp = (t1 + t2) / 2.0;
+    hum  = (h1 + h2) / 2.0;
+    tempMax = max(t1, t2);
+    if (fabs(t1 - t2) > 2.0) Serial.println(F("AVISO: los sensores difieren mas de 2 C"));
+  } else if (ok1) {
+    temp = t1; hum = h1; tempMax = t1;
+    Serial.println(F("AVISO: sensor 2 no responde"));
+  } else {
+    temp = t2; hum = h2; tempMax = t2;
+    Serial.println(F("AVISO: sensor 1 no responde"));
+  }
+
+  // ---- Control de temperatura (con histéresis) ----
+  if (tempMax >= TEMP_MAXIMA)                    resistenciaOn = false;  // seguridad
+  else if (temp >= TEMP_OBJETIVO)                resistenciaOn = false;  // llegó: apagar
+  else if (temp <= TEMP_OBJETIVO - TEMP_HISTERESIS) resistenciaOn = true; // bajó: encender
+  digitalWrite(PIN_RESISTENCIA, resistenciaOn ? LOW : HIGH);
+
+  // ---- Humedad (solo monitoreo, sin humidificador) ----
+  float hMin = (dia >= DIA_PARAR_VOLTEO) ? HUM_MIN_2 : HUM_MIN_1;
+  float hMax = (dia >= DIA_PARAR_VOLTEO) ? HUM_MAX_2 : HUM_MAX_1;
+  const char* estadoHum = "OK";
+  if (hum < hMin) estadoHum = "BAJA (agrega agua)";
+  else if (hum > hMax) estadoHum = "ALTA (ventila)";
+
+  // ---- Monitor serie ----
+  Serial.print(F("Dia ")); Serial.print(dia);
+  Serial.print(F(" | T=")); Serial.print(temp, 1);
+  Serial.print(F(" C | H=")); Serial.print(hum, 0);
+  Serial.print(F(" % ")); Serial.print(estadoHum);
+  Serial.print(F(" | Resistencia: ")); Serial.print(resistenciaOn ? "ON" : "OFF");
+  Serial.print(F(" | Motor: ")); Serial.println(motorEncendido ? "gira" : "parado");
+
+  if (dia > DIAS_TOTALES) Serial.println(F("Incubacion terminada"));
+}
